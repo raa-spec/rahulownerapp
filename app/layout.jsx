@@ -19,9 +19,14 @@ export const metadata = {
   title: "ZERIY — Owner & Staff Portal | Made Simpler And Much Faster",
   description:
     "Manage queues, daily staff/doctor shifts, and terminal counters for saloons, parlours, clinics, and diagnostic centres.",
-  icons: {
-    icon: "/logo.png",
-    apple: "/logo.png",
+ icons: {
+    icon: [
+      { url: "/logo.png", type: "image/png" },
+    ],
+    shortcut: "/logo.png",
+    apple: [
+      { url: "/logo.png", type: "image/png" },
+    ],
   },
 };
 
