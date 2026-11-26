@@ -1,0 +1,789 @@
+
+import { NextResponse } from "next/server";
+import { getServerSession } from "next-auth";
+import { Readable } from "node:stream";
+import { randomUUID } from "node:crypto";
+import { v2 as cloudinary } from "cloudinary";
+import clientPromise from "@/lib/mongodb";
+import { authOptions } from "@/app/api/auth/[...nextauth]/route";
+import { ObjectId } from "mongodb";
+
+const MAX_IMAGE_SIZE = 5 * 1024 * 1024;
+const MAX_PROOF_SIZE = 5 * 1024 * 1024;
+
+const ALLOWED_IMAGE_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+];
+
+const ALLOWED_PROOF_TYPES = [
+  "application/pdf",
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+];
+
+const categories = {
+  clinic: {
+    collection: "clinics",
+    title: "Clinic",
+  },
+  saloon: {
+    collection: "saloons",
+    title: "Salon",
+  },
+  "beauty-parlour": {
+    collection: "parlour",
+    title: "Beauty Parlour",
+  },
+  "diagnostic-centre": {
+    collection: "diagnostic",
+    title: "Diagnostic Centre",
+  },
+};
+
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key: process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET,
+});
+
+function escapeRegex(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isCloudinaryConfigured() {
+  return Boolean(
+    process.env.CLOUDINARY_CLOUD_NAME &&
+    process.env.CLOUDINARY_API_KEY &&
+    process.env.CLOUDINARY_API_SECRET
+  );
+}
+
+function uploadImageToCloudinary(buffer, mimetype) {
+  return new Promise((resolve, reject) => {
+    const stream = cloudinary.uploader.upload_stream(
+      {
+        folder: "zeriy/businesses",
+        resource_type: "image",
+        allowed_formats: ["jpg", "jpeg", "png", "webp"],
+        transformation: [
+          {
+            width: 1600,
+            height: 1600,
+            crop: "limit",
+            quality: "auto",
+            fetch_format: "auto",
+          },
+        ],
+        context: {
+          source: "zeriy-business-registration",
+          original_mimetype: mimetype,
+        },
+      },
+      (error, result) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        if (!result?.secure_url || !result?.public_id) {
+          reject(new Error("Cloudinary image upload failed."));
+          return;
+        }
+
+        resolve({
+          url: result.secure_url,
+          publicId: result.public_id,
+          resourceType: "image",
+        });
+      }
+    );
+
+    Readable.from(buffer).pipe(stream);
+  });
+}
+
+function uploadProofToCloudinary(buffer, mimetype) {
+  const isPdf = mimetype === "application/pdf";
+  const resourceType = isPdf ? "raw" : "image";
+
+  return new Promise((resolve, reject) => {
+    const options = {
+      folder: "zeriy/business-identity-proofs",
+      resource_type: resourceType,
+      public_id: isPdf
+        ? `shop-proof-${randomUUID()}.pdf`
+        : `shop-proof-${randomUUID()}`,
+      context: {
+        source: "zeriy-business-registration",
+        original_mimetype: mimetype,
+      },
+    };
+
+    if (!isPdf) {
+      options.allowed_formats = ["jpg", "jpeg", "png", "webp"];
+    }
+
+    const stream = cloudinary.uploader.upload_stream(
+      options,
+      (error, result) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+
+        if (!result?.secure_url || !result?.public_id) {
+          reject(new Error("Cloudinary identity proof upload failed."));
+          return;
+        }
+
+        resolve({
+          url: result.secure_url,
+          publicId: result.public_id,
+          resourceType,
+        });
+      }
+    );
+
+    Readable.from(buffer).pipe(stream);
+  });
+}
+
+function validateImageSignature(buffer, mimetype) {
+  const isJpeg =
+    buffer.length >= 3 &&
+    buffer[0] === 0xff &&
+    buffer[1] === 0xd8 &&
+    buffer[2] === 0xff;
+
+  const isPng =
+    buffer.length >= 8 &&
+    buffer.subarray(0, 8).equals(
+      Buffer.from([
+        0x89, 0x50, 0x4e, 0x47,
+        0x0d, 0x0a, 0x1a, 0x0a,
+      ])
+    );
+
+  const isWebp =
+    buffer.length >= 12 &&
+    buffer.toString("ascii", 0, 4) === "RIFF" &&
+    buffer.toString("ascii", 8, 12) === "WEBP";
+
+  return (
+    (mimetype === "image/jpeg" && isJpeg) ||
+    (mimetype === "image/png" && isPng) ||
+    (mimetype === "image/webp" && isWebp)
+  );
+}
+
+function validateProofSignature(buffer, mimetype) {
+  if (mimetype === "application/pdf") {
+    return (
+      buffer.length >= 5 &&
+      buffer.toString("ascii", 0, 5) === "%PDF-"
+    );
+  }
+
+  return validateImageSignature(buffer, mimetype);
+}
+
+async function cleanupCloudinaryUploads(uploads) {
+  for (const upload of uploads) {
+    if (!upload?.publicId) continue;
+
+    try {
+      await cloudinary.uploader.destroy(upload.publicId, {
+        resource_type: upload.resourceType,
+      });
+    } catch (error) {
+      console.error("Cloudinary cleanup error:", error);
+    }
+  }
+}
+
+export async function POST(req) {
+  let db;
+  let businessCollection;
+  let businessId;
+  let ownerId;
+
+  const uploadedAssets = [];
+
+  try {
+    const session = await getServerSession(authOptions);
+
+    if (!session?.user?.email) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Please log in first.",
+        },
+        { status: 401 }
+      );
+    }
+
+    let body;
+    let imageFile = null;
+    let proofFile = null;
+
+    const contentType = req.headers.get("content-type") || "";
+
+    if (contentType.includes("multipart/form-data")) {
+      const formData = await req.formData();
+      const details = formData.get("details");
+
+      if (typeof details !== "string") {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "Business details are missing.",
+          },
+          { status: 400 }
+        );
+      }
+
+      try {
+        body = JSON.parse(details);
+      } catch {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "Invalid business details.",
+          },
+          { status: 400 }
+        );
+      }
+
+      const uploadedImage = formData.get("businessImage");
+
+      if (
+        uploadedImage &&
+        typeof uploadedImage.arrayBuffer === "function" &&
+        uploadedImage.size > 0
+      ) {
+        imageFile = uploadedImage;
+      }
+
+      const uploadedProof = formData.get("shopIdentityProof");
+
+      if (
+        uploadedProof &&
+        typeof uploadedProof.arrayBuffer === "function" &&
+        uploadedProof.size > 0
+      ) {
+        proofFile = uploadedProof;
+      }
+    } else {
+      body = await req.json();
+    }
+
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Invalid request data.",
+        },
+        { status: 400 }
+      );
+    }
+
+    // Identity proof is mandatory.
+    if (!proofFile) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Please upload your shop identity proof.",
+        },
+        { status: 400 }
+      );
+    }
+
+    const {
+      category,
+      businessName,
+      phone,
+      email,
+      address,
+      city,
+      pincode,
+    } = body;
+
+    const categoryConfig = categories[category];
+
+    if (!categoryConfig) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Invalid business category.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (
+      typeof businessName !== "string" ||
+      !businessName.trim() ||
+      businessName.trim().length > 150
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Enter a valid business name.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (
+      typeof phone !== "string" ||
+      !/^[6-9]\d{9}$/.test(phone.trim())
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Enter a valid Indian mobile number.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (
+      typeof address !== "string" ||
+      !address.trim() ||
+      address.trim().length > 1000
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Enter a valid business address.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (
+      city !== undefined &&
+      (typeof city !== "string" || city.trim().length > 100)
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Enter a valid city.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (
+      pincode !== undefined &&
+      (typeof pincode !== "string" ||
+        !/^\d{6}$/.test(pincode.trim()))
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Enter a valid 6-digit PIN code.",
+        },
+        { status: 400 }
+      );
+    }
+
+    const businessEmail =
+      typeof email === "string" ? email.trim().toLowerCase() : "";
+
+    if (
+      businessEmail &&
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(businessEmail)
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Enter a valid business email address.",
+        },
+        { status: 400 }
+      );
+    }
+
+    const lat = Number(body.lat ?? body.latitude);
+    const lng = Number(body.lng ?? body.longitude);
+
+    if (
+      !Number.isFinite(lat) ||
+      !Number.isFinite(lng) ||
+      lat < -90 ||
+      lat > 90 ||
+      lng < -180 ||
+      lng > 180
+    ) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Invalid business location.",
+        },
+        { status: 400 }
+      );
+    }
+
+    // Validate optional business image.
+    if (imageFile) {
+      if (!ALLOWED_IMAGE_TYPES.includes(imageFile.type)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "Only JPG, PNG, and WebP business images are allowed.",
+          },
+          { status: 400 }
+        );
+      }
+
+      if (imageFile.size > MAX_IMAGE_SIZE) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "Business image must be 5 MB or smaller.",
+          },
+          { status: 400 }
+        );
+      }
+    }
+
+    // Validate mandatory identity proof.
+    if (!ALLOWED_PROOF_TYPES.includes(proofFile.type)) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Identity proof must be PDF, JPG, PNG, or WebP.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (proofFile.size > MAX_PROOF_SIZE) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Shop identity proof must be 5 MB or smaller.",
+        },
+        { status: 400 }
+      );
+    }
+
+    if (!isCloudinaryConfigured()) {
+      throw new Error("Cloudinary environment variables are missing.");
+    }
+
+    const normalizedEmail = session.user.email
+      .trim()
+      .toLowerCase();
+
+    const client = await clientPromise;
+    db = client.db(process.env.MONGODB);
+
+    const owner = await db.collection("owners").findOne(
+      {
+        email: {
+          $regex: `^${escapeRegex(normalizedEmail)}$`,
+          $options: "i",
+        },
+      },
+      {
+        projection: {
+          _id: 1,
+          name: 1,
+          email: 1,
+        },
+      }
+    );
+
+    if (!owner) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "Owner account not found.",
+        },
+        { status: 404 }
+      );
+    }
+
+    ownerId = owner._id;
+    businessCollection = categoryConfig.collection;
+
+    let imageData = {
+      url: "",
+      publicId: "",
+      resourceType: "image",
+    };
+
+    // Upload optional business image.
+    if (imageFile) {
+      const buffer = Buffer.from(await imageFile.arrayBuffer());
+
+      if (!validateImageSignature(buffer, imageFile.type)) {
+        return NextResponse.json(
+          {
+            success: false,
+            message: "The selected business image is invalid.",
+          },
+          { status: 400 }
+        );
+      }
+
+      imageData = await uploadImageToCloudinary(
+        buffer,
+        imageFile.type
+      );
+
+      uploadedAssets.push(imageData);
+    }
+
+    // Upload mandatory shop identity proof.
+    const proofBuffer = Buffer.from(
+      await proofFile.arrayBuffer()
+    );
+
+    if (!validateProofSignature(proofBuffer, proofFile.type)) {
+      return NextResponse.json(
+        {
+          success: false,
+          message: "The selected identity proof is not a valid file.",
+        },
+        { status: 400 }
+      );
+    }
+
+    const proofData = await uploadProofToCloudinary(
+      proofBuffer,
+      proofFile.type
+    );
+
+    uploadedAssets.push(proofData);
+
+    const now = new Date();
+
+    const businessData = {
+      ownerId,
+      ownerName: owner.name || session.user.name || "",
+      ownerEmail: normalizedEmail,
+
+      category,
+      categoryName: categoryConfig.title,
+
+      name: businessName.trim(),
+      phone: phone.trim(),
+      email: businessEmail,
+
+      address: address.trim(),
+      city: typeof city === "string" ? city.trim() : "",
+      pincode:
+        typeof pincode === "string" ? pincode.trim() : "",
+
+      lat,
+      lng,
+
+      imageUrl: imageData.url,
+      imagePublicId: imageData.publicId,
+
+      // Shop identity proof.
+      shopIdentityProofUrl: proofData.url,
+      shopIdentityProofPublicId: proofData.publicId,
+      shopIdentityProofType: proofFile.type,
+
+      setupCompleted: false,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    const insertResult = await db
+      .collection(businessCollection)
+      .insertOne(businessData);
+
+    businessId = insertResult.insertedId;
+
+    const updateResult = await db.collection("owners").updateOne(
+      { _id: ownerId },
+      {
+        $addToSet: {
+          business: {
+            businessId,
+            collection: businessCollection,
+          },
+        },
+        $set: {
+          updatedAt: now,
+        },
+      }
+    );
+
+    if (updateResult.matchedCount !== 1) {
+      throw new Error("Could not link business to owner.");
+    }
+
+    return NextResponse.json(
+      {
+        success: true,
+        message: "Business saved successfully.",
+        businessId: businessId.toString(),
+        category,
+        categoryName: categoryConfig.title,
+        imageUrl: imageData.url,
+        shopIdentityProofUrl: proofData.url,
+        nextRoute: "/owner/dashboard",
+      },
+      { status: 201 }
+    );
+  } catch (error) {
+    console.error("Create business error:", error);
+
+    // Roll back business if it was already inserted.
+    if (db && businessCollection && businessId) {
+      try {
+        await db.collection(businessCollection).deleteOne({
+          _id: businessId,
+        });
+
+        if (ownerId) {
+          await db.collection("owners").updateOne(
+            { _id: ownerId },
+            {
+              $pull: {
+                business: {
+                  businessId,
+                  collection: businessCollection,
+                },
+              },
+            }
+          );
+        }
+      } catch (rollbackError) {
+        console.error("Business rollback error:", rollbackError);
+      }
+    }
+
+    // Remove all uploaded Cloudinary assets after failure.
+    await cleanupCloudinaryUploads(uploadedAssets);
+
+    return NextResponse.json(
+      {
+        success: false,
+        message: "Unable to save business. Please try again.",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+export async function GET() {
+  try {
+    const session = await getServerSession(authOptions);
+
+    if (!session?.user?.email) {
+      return NextResponse.json(
+        { error: "Please log in first." },
+        { status: 401 }
+      );
+    }
+
+    const client = await clientPromise;
+    const db = client.db(process.env.MONGODB);
+
+    const normalizedEmail = session.user.email.trim();
+
+    const owner = await db.collection("owners").findOne(
+      {
+        email: {
+          $regex: `^${escapeRegex(normalizedEmail)}$`,
+          $options: "i",
+        },
+      },
+      {
+        projection: {
+          _id: 1,
+          name: 1,
+          email: 1,
+          business: 1,
+        },
+      }
+    );
+
+    if (!owner) {
+      return NextResponse.json(
+        { error: "Owner account not found." },
+        { status: 404 }
+      );
+    }
+
+    const references = Array.isArray(owner.business)
+      ? owner.business
+      : [];
+
+    const businesses = await Promise.all(
+      references.map(async (reference) => {
+        if (!reference || typeof reference !== "object") {
+          return null;
+        }
+
+        const collectionName = String(
+          reference.collection || ""
+        ).trim();
+
+        if (
+          !Object.values(categories).some(
+            (item) => item.collection === collectionName
+          ) ||
+          !reference.businessId
+        ) {
+          return null;
+        }
+
+        const businessObjectId =
+          reference.businessId instanceof ObjectId
+            ? reference.businessId
+            : new ObjectId(reference.businessId);
+
+        const business = await db
+          .collection(collectionName)
+          .findOne({
+            _id: businessObjectId,
+            ownerId: owner._id,
+          });
+
+        if (!business) {
+          return null;
+        }
+
+        const { _id, ...businessData } = business;
+
+        return {
+          ...businessData,
+          _id: _id.toString(),
+          collection: collectionName,
+          businessName:
+            business.businessName || business.name || "",
+        };
+      })
+    );
+
+    const validBusinesses = businesses
+      .filter(Boolean)
+      .sort(
+        (a, b) =>
+          new Date(b.createdAt || 0).getTime() -
+          new Date(a.createdAt || 0).getTime()
+      );
+
+    return NextResponse.json({
+      success: true,
+      businesses: validBusinesses,
+    });
+  } catch (error) {
+    console.error("Fetch owner businesses error:", error);
+
+    return NextResponse.json(
+      { error: "Failed to load businesses." },
+      { status: 500 }
+    );
+  }
+}
